@@ -1,5 +1,5 @@
 {
-  "total_visits": 2,
+  "total_visits": 3,
   "visits": [
     {
       "timestamp": "2026-10-28T10:55:07.332634",
@@ -8,6 +8,10 @@
     {
       "timestamp": "2026-10-28T10:55:10.518483",
       "session_id": "d3ba30bb-818f-46f2-9a5d-8c4403d71097"
+    },
+    {
+      "timestamp": "2026-10-28T10:55:15.904637",
+      "session_id": "ff17a6f7-ab36-491f-bc02-6ef342b0c9e4"
     }
   ]
 }
