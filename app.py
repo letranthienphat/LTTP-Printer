@@ -1,23 +1,27 @@
 import streamlit as st
 import extra_streamlit_components as stx
-from github import Github, GithubException, InputGitTreeElement
+from github import Github, GithubException
 import json
 import uuid
 import time
 from datetime import datetime, timedelta
 import base64
-import hashlib
 import bcrypt
 import binascii
 
 # ============================================================
-# CẤU HÌNH & SECRETS
+# CẤU HÌNH & SECRETS (chỉ đọc từ st.secrets, không fallback)
 # ============================================================
-REPO_NAME = st.secrets.get("GITHUB_REPO", "")
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
-SYSTEM_ADMIN_PASSWORD = st.secrets.get("SYSTEM_ADMIN_PASSWORD", "Tp27111510")  # Fallback cho dev, nên xóa khi production
+REPO_NAME = st.secrets.get("GITHUB_REPO")
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
+SYSTEM_ADMIN_PASSWORD = st.secrets.get("SYSTEM_ADMIN_PASSWORD")
+
+if not REPO_NAME or not GITHUB_TOKEN or not SYSTEM_ADMIN_PASSWORD:
+    st.error("Thiếu cấu hình trong st.secrets: cần GITHUB_REPO, GITHUB_TOKEN, SYSTEM_ADMIN_PASSWORD.")
+    st.stop()
+
 DATA_DIR = "print_data"
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
+MAX_FILE_SIZE = 25 * 1024 * 1024
 ALLOWED_EXTENSIONS = [
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg",
     "txt", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv",
@@ -25,34 +29,24 @@ ALLOWED_EXTENSIONS = [
 ]
 
 # ============================================================
-# KHỞI TẠO GITHUB CLIENT (CÓ RETRY)
+# GITHUB CLIENT
 # ============================================================
 @st.cache_resource
 def get_github_repo():
-    if not GITHUB_TOKEN or not REPO_NAME:
-        st.error("Chưa cấu hình GITHUB_TOKEN hoặc GITHUB_REPO trong secrets.")
-        st.stop()
     g = Github(GITHUB_TOKEN)
     return g.get_repo(REPO_NAME)
 
-def gh_read_file(path, retries=2):
-    """Đọc file từ GitHub với cơ chế retry đơn giản."""
+def gh_read_file(path):
     repo = get_github_repo()
-    for attempt in range(retries + 1):
-        try:
-            contents = repo.get_contents(path)
-            return contents.decoded_content, contents.sha
-        except GithubException as e:
-            if e.status == 404:
-                return None, None
-            if attempt == retries:
-                st.error(f"Lỗi GitHub API khi đọc file {path}: {e}")
-                return None, None
-            time.sleep(1)
-    return None, None
+    try:
+        contents = repo.get_contents(path)
+        return contents.decoded_content, contents.sha
+    except GithubException as e:
+        if e.status == 404:
+            return None, None
+        raise
 
 def gh_write_file(path, content_bytes, commit_message, existing_sha=None):
-    """Ghi file lên GitHub, tự động tạo hoặc update."""
     repo = get_github_repo()
     if existing_sha:
         repo.update_file(path, commit_message, content_bytes, existing_sha)
@@ -60,11 +54,11 @@ def gh_write_file(path, content_bytes, commit_message, existing_sha=None):
         try:
             repo.create_file(path, commit_message, content_bytes)
         except GithubException as e:
-            if e.status == 422:  # File đã tồn tại
+            if e.status == 422:
                 existing = repo.get_contents(path)
                 repo.update_file(path, commit_message, content_bytes, existing.sha)
             else:
-                raise e
+                raise
 
 def gh_delete_file(path, commit_message):
     repo = get_github_repo()
@@ -84,7 +78,7 @@ def gh_ensure_dir(dir_path):
             repo.create_file(f"{dir_path}/.gitkeep", f"Tạo thư mục {dir_path}", b"")
 
 # ============================================================
-# QUẢN LÝ DỮ LIỆU JSON
+# JSON HELPERS
 # ============================================================
 def load_json(path, default=None):
     if default is None:
@@ -129,33 +123,24 @@ def record_visit():
         st.session_state["visit_recorded"] = True
 
 # ============================================================
-# COOKIE MANAGER (SỬA LỖI TRÙNG LẶP)
+# COOKIE MANAGER (singleton, gọi 1 lần mỗi rerun)
 # ============================================================
 def get_cookie_manager():
-    """Trả về instance CookieManager duy nhất cho session hiện tại."""
     if "cookie_manager" not in st.session_state:
-        # Sử dụng key duy nhất để tránh xung đột
-        st.session_state.cookie_manager = stx.CookieManager(key="print_app_cookie_mgr")
+        st.session_state.cookie_manager = stx.CookieManager(key="print_cookie_mgr")
     return st.session_state.cookie_manager
 
-def get_admin_session_from_cookie():
+def read_admin_cookie_once():
+    """Đọc cookie 1 lần, cache trong st.session_state của rerun hiện tại."""
     cm = get_cookie_manager()
-    # get_all có thể cần key riêng nếu gọi nhiều lần, nhưng ở đây gọi 1 lần
     cookies = cm.get_all()
     if cookies is None:
         return None, None
-    role = cookies.get("print_admin_role")
-    token = cookies.get("print_admin_token")
-    if role and token:
-        sessions = load_json(f"{DATA_DIR}/admin_sessions.json", {"sessions": {}})
-        if token in sessions.get("sessions", {}):
-            return role, token
-    return None, None
+    return cookies.get("print_admin_role"), cookies.get("print_admin_token")
 
 def set_admin_cookie(role, token):
     cm = get_cookie_manager()
     expires = datetime.now() + timedelta(days=30)
-    # Thêm key riêng cho từng thao tác set để tránh DuplicateWidgetID
     cm.set("print_admin_role", role, expires_at=expires, key="set_role")
     cm.set("print_admin_token", token, expires_at=expires, key="set_token")
 
@@ -175,27 +160,38 @@ def create_admin_session(role):
     set_admin_cookie(role, token)
     return token
 
+def resolve_current_role():
+    """Trả về role hiện tại dựa trên cookie. Gọi đúng 1 lần mỗi rerun."""
+    if "resolved_role" in st.session_state:
+        return st.session_state["resolved_role"]
+    role, token = read_admin_cookie_once()
+    resolved = None
+    if role and token:
+        sessions = load_json(f"{DATA_DIR}/admin_sessions.json", {"sessions": {}})
+        if token in sessions.get("sessions", {}):
+            resolved = role
+    st.session_state["resolved_role"] = resolved
+    return resolved
+
+def clear_resolved_role():
+    st.session_state.pop("resolved_role", None)
+
 # ============================================================
-# XỬ LÝ MẬT KHẨU (BCRYPT)
+# PASSWORD (BCRYPT)
 # ============================================================
 def hash_password(password: str) -> str:
-    """Băm mật khẩu bằng bcrypt, trả về chuỗi hex."""
-    salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    return binascii.hexlify(hashed).decode('utf-8')
+    return binascii.hexlify(bcrypt.hashpw(password.encode(), bcrypt.gensalt())).decode()
 
 def verify_password(password: str, stored_hex: str) -> bool:
-    """Xác thực mật khẩu với hash hex đã lưu."""
     if not stored_hex:
         return False
     try:
-        hashed_bytes = binascii.unhexlify(stored_hex.encode('utf-8'))
-        return bcrypt.checkpw(password.encode('utf-8'), hashed_bytes)
+        return bcrypt.checkpw(password.encode(), binascii.unhexlify(stored_hex.encode()))
     except (binascii.Error, ValueError):
         return False
 
 # ============================================================
-# GIAO DIỆN CHÍNH
+# MAIN
 # ============================================================
 def main():
     st.set_page_config(page_title="Dịch vụ in tài liệu", page_icon="🖨️", layout="wide")
@@ -215,15 +211,12 @@ def main():
         "server_closed_reason": ""
     })
 
-    # Lấy role từ cookie (chỉ gọi 1 lần duy nhất ở đây)
-    current_role, _ = get_admin_session_from_cookie()
+    current_role = resolve_current_role()
 
-    # Kiểm tra server đóng (trừ system_admin)
     if admin_config.get("server_closed", False) and current_role != "system_admin":
         st.error(f"🚫 **Dịch vụ in đã ngừng.**\n\nLý do: {admin_config.get('server_closed_reason', 'Không có lý do')}")
         st.stop()
 
-    # Điều hướng dựa trên role
     if current_role is None:
         show_login_form(admin_config)
         return
@@ -234,16 +227,17 @@ def main():
         show_system_admin_dashboard(admin_config)
     else:
         clear_admin_cookie()
+        clear_resolved_role()
         st.rerun()
 
 # ============================================================
-# FORM ĐĂNG NHẬP
+# LOGIN
 # ============================================================
 def show_login_form(admin_config):
     st.title("🖨️ Dịch vụ in tài liệu")
     st.caption("Vui lòng nhập tên của bạn để tiếp tục.")
 
-    name = st.text_input("Tên của bạn", placeholder="Nhập tên...")
+    name = st.text_input("Tên của bạn", placeholder="Nhập tên...", key="login_name")
 
     if name:
         name_lower = name.strip().lower()
@@ -256,19 +250,17 @@ def show_login_form(admin_config):
                 stored_hash = admin_config.get("photo_password_hash")
                 if stored_hash is None:
                     st.info("Lần đầu đăng nhập: mật khẩu bạn nhập sẽ được đặt làm mật khẩu admin in.")
-                    if st.button("Cài đặt mật khẩu", type="primary"):
+                    if st.button("Cài đặt mật khẩu", type="primary", key="set_pwd_btn"):
                         admin_config["photo_password_hash"] = hash_password(password)
                         save_json(f"{DATA_DIR}/admin_config.json", admin_config, "Cài đặt mật khẩu admin in")
                         create_admin_session("print_admin")
-                        st.success("Đã cài đặt! Đang chuyển hướng...")
-                        time.sleep(1)
+                        clear_resolved_role()
                         st.rerun()
                 else:
-                    if st.button("Đăng nhập", type="primary"):
+                    if st.button("Đăng nhập", type="primary", key="login_photo_btn"):
                         if verify_password(password, stored_hash):
                             create_admin_session("print_admin")
-                            st.success("Đăng nhập thành công!")
-                            time.sleep(1)
+                            clear_resolved_role()
                             st.rerun()
                         else:
                             st.error("Mật khẩu không đúng.")
@@ -276,17 +268,17 @@ def show_login_form(admin_config):
         elif name_lower == "admin":
             st.subheader("🔐 Đăng nhập Admin Hệ Thống")
             password = st.text_input("Mật khẩu", type="password", key="sys_pass")
+
             if password:
-                if st.button("Đăng nhập", type="primary"):
+                if st.button("Đăng nhập", type="primary", key="login_sys_btn"):
                     if password == SYSTEM_ADMIN_PASSWORD:
                         create_admin_session("system_admin")
-                        st.success("Đăng nhập thành công!")
-                        time.sleep(1)
+                        clear_resolved_role()
                         st.rerun()
                     else:
                         st.error("Mật khẩu không đúng.")
         else:
-            if st.button("Tiếp tục", type="primary"):
+            if st.button("Tiếp tục", type="primary", key="continue_user_btn"):
                 st.session_state["user_name"] = name.strip()
                 st.session_state["role"] = "user"
                 st.rerun()
@@ -295,7 +287,7 @@ def show_login_form(admin_config):
     st.caption("⚠️ Không gửi các file quan trọng như đề thi nếu lo ngại tính an toàn và bảo mật.")
 
 # ============================================================
-# MÀN HÌNH USER
+# USER SCREEN
 # ============================================================
 def show_user_screen():
     user_name = st.session_state.get("user_name", "")
@@ -303,12 +295,12 @@ def show_user_screen():
     st.write(f"Xin chào, **{user_name}**!")
 
     requests_data = load_json(f"{DATA_DIR}/requests.json", {"requests": []})
-    user_requests = [r for r in requests_data.get("requests", [])
-                     if r.get("user_name") == user_name and r.get("admin_reply")]
+    user_replies = [r for r in requests_data.get("requests", [])
+                    if r.get("user_name") == user_name and r.get("admin_reply")]
 
-    if user_requests:
+    if user_replies:
         st.subheader("📬 Phản hồi từ Admin")
-        for req in user_requests:
+        for req in user_replies:
             if not req.get("reply_read", False):
                 with st.container(border=True):
                     st.write(f"**Yêu cầu:** {req.get('file_name', 'N/A')}")
@@ -327,9 +319,10 @@ def show_user_screen():
         uploaded_file = st.file_uploader(
             "Chọn file cần in",
             type=ALLOWED_EXTENSIONS,
-            help="Hỗ trợ ảnh, văn bản, file nén. Tối đa 25MB mỗi file."
+            help="Hỗ trợ ảnh, văn bản, file nén. Tối đa 25MB mỗi file.",
+            key="uploader"
         )
-        note = st.text_area("Yêu cầu khác (không bắt buộc)", placeholder="Ví dụ: In 2 bản, in màu...")
+        note = st.text_area("Yêu cầu khác (không bắt buộc)", placeholder="Ví dụ: In 2 bản, in màu...", key="note")
         submitted = st.form_submit_button("📤 Gửi yêu cầu", type="primary")
 
         if submitted:
@@ -366,21 +359,26 @@ def show_user_screen():
                 save_json(f"{DATA_DIR}/requests.json", requests_data, f"Yêu cầu in mới từ {user_name}")
 
                 st.success(f"✅ Đã gửi yêu cầu in file **{uploaded_file.name}**.")
-                st.balloons()
+                # Không rerun ở đây để giữ thông báo thành công; user có thể tự làm mới
+                # (form đã clear_on_submit nên đã reset)
 
-    if st.button("🚪 Đăng xuất"):
-        for key in ["user_name", "role", "session_id"]:
-            st.session_state.pop(key, None)
+    if st.button("🚪 Đăng xuất", key="logout_user"):
+        for k in ["user_name", "role", "session_id", "visit_recorded"]:
+            st.session_state.pop(k, None)
         st.rerun()
 
 # ============================================================
-# ADMIN IN DASHBOARD
+# PRINT ADMIN DASHBOARD
 # ============================================================
 def show_print_admin_dashboard():
     st.title("🖨️ Admin In - Danh sách chờ")
-    if st.button("🚪 Đăng xuất"):
-        clear_admin_cookie()
-        st.rerun()
+
+    col_logout, _ = st.columns([1, 4])
+    with col_logout:
+        if st.button("🚪 Đăng xuất", key="logout_print_admin"):
+            clear_admin_cookie()
+            clear_resolved_role()
+            st.rerun()
 
     st.markdown("---")
     requests_data = load_json(f"{DATA_DIR}/requests.json", {"requests": []})
@@ -390,7 +388,11 @@ def show_print_admin_dashboard():
     confirmed = [r for r in requests if r.get("status") == "confirmed"]
     rejected = [r for r in requests if r.get("status") == "rejected"]
 
-    tab1, tab2, tab3 = st.tabs([f"⏳ Chờ ({len(pending)})", f"✅ Đã xác nhận ({len(confirmed)})", f"❌ Từ chối ({len(rejected)})"])
+    tab1, tab2, tab3 = st.tabs([
+        f"⏳ Chờ ({len(pending)})",
+        f"✅ Đã xác nhận ({len(confirmed)})",
+        f"❌ Từ chối ({len(rejected)})"
+    ])
 
     with tab1:
         if not pending:
@@ -409,10 +411,16 @@ def show_print_admin_dashboard():
                     file_data = load_json(req.get("file_path"))
                     if file_data:
                         file_bytes = base64.b64decode(file_data["content_b64"])
-                        st.download_button("📥 Tải file", data=file_bytes, file_name=req.get("file_name"), key=f"dl_{req['id']}")
+                        st.download_button(
+                            "📥 Tải file",
+                            data=file_bytes,
+                            file_name=req.get("file_name"),
+                            key=f"dl_{req['id']}"
+                        )
 
                 st.markdown("---")
                 c1, c2, c3 = st.columns(3)
+
                 with c1:
                     if st.button("✅ Xác nhận in", key=f"confirm_{req['id']}"):
                         for r in requests_data["requests"]:
@@ -421,6 +429,7 @@ def show_print_admin_dashboard():
                                 r["confirmed_at"] = datetime.now().isoformat()
                         save_json(f"{DATA_DIR}/requests.json", requests_data, f"Xác nhận {req['id']}")
                         st.rerun()
+
                 with c2:
                     reply = st.text_area("Hỏi đáp", key=f"ask_{req['id']}", placeholder="Nhập câu hỏi...")
                     if st.button("📨 Gửi hỏi đáp", key=f"send_ask_{req['id']}"):
@@ -431,7 +440,8 @@ def show_print_admin_dashboard():
                             save_json(f"{DATA_DIR}/requests.json", requests_data, f"Hỏi đáp {req['id']}")
                             st.rerun()
                         else:
-                            st.warning("Nhập nội dung.")
+                            st.warning("Nhập nội dung hỏi đáp.")
+
                 with c3:
                     reason = st.text_area("Lý do từ chối", key=f"reject_{req['id']}", placeholder="Nhập lý do...")
                     if st.button("❌ Từ chối", key=f"reject_btn_{req['id']}"):
@@ -443,7 +453,7 @@ def show_print_admin_dashboard():
                             save_json(f"{DATA_DIR}/requests.json", requests_data, f"Từ chối {req['id']}")
                             st.rerun()
                         else:
-                            st.warning("Nhập lý do.")
+                            st.warning("Nhập lý do từ chối.")
 
                 st.markdown("---")
                 if st.button("🗑️ Xóa yêu cầu này", key=f"del_{req['id']}"):
@@ -456,13 +466,20 @@ def show_print_admin_dashboard():
                     st.rerun()
 
     with tab2:
+        if not confirmed:
+            st.info("Chưa có yêu cầu nào được xác nhận.")
         for req in confirmed:
             with st.container(border=True):
-                st.write(f"**File:** {req.get('file_name')} | **Người gửi:** {req.get('user_name')}")
+                st.write(f"**File:** {req.get('file_name')} | **Người gửi:** {req.get('user_name')} | **Xác nhận lúc:** {req.get('confirmed_at', '')[:19]}")
                 file_data = load_json(req.get("file_path"))
                 if file_data:
                     file_bytes = base64.b64decode(file_data["content_b64"])
-                    st.download_button("📥 Tải file", data=file_bytes, file_name=req.get("file_name"), key=f"dl_conf_{req['id']}")
+                    st.download_button(
+                        "📥 Tải file",
+                        data=file_bytes,
+                        file_name=req.get("file_name"),
+                        key=f"dl_conf_{req['id']}"
+                    )
                 if st.button("🗑️ Xóa", key=f"del_conf_{req['id']}"):
                     gh_delete_file(req.get("file_path"), f"Xóa file {req['id']}")
                     requests_data["requests"] = [r for r in requests_data["requests"] if r["id"] != req["id"]]
@@ -470,6 +487,8 @@ def show_print_admin_dashboard():
                     st.rerun()
 
     with tab3:
+        if not rejected:
+            st.info("Chưa có yêu cầu nào bị từ chối.")
         for req in rejected:
             with st.container(border=True):
                 st.write(f"**File:** {req.get('file_name')} | **Người gửi:** {req.get('user_name')}")
@@ -485,8 +504,10 @@ def show_print_admin_dashboard():
 # ============================================================
 def show_system_admin_dashboard(admin_config):
     st.title("⚙️ Admin Hệ Thống")
-    if st.button("🚪 Đăng xuất"):
+
+    if st.button("🚪 Đăng xuất", key="logout_sys_admin"):
         clear_admin_cookie()
+        clear_resolved_role()
         st.rerun()
 
     st.markdown("---")
@@ -495,15 +516,15 @@ def show_system_admin_dashboard(admin_config):
 
     if server_closed:
         st.error(f"**Máy chủ đang ĐÓNG.** Lý do: {admin_config.get('server_closed_reason', '')}")
-        if st.button("✅ Mở lại máy chủ", type="primary"):
+        if st.button("✅ Mở lại máy chủ", type="primary", key="open_server"):
             admin_config["server_closed"] = False
             admin_config["server_closed_reason"] = ""
             save_json(f"{DATA_DIR}/admin_config.json", admin_config, "Mở lại máy chủ")
             st.rerun()
     else:
         st.success("**Máy chủ đang HOẠT ĐỘNG.**")
-        reason = st.text_input("Lý do đóng máy chủ", placeholder="Nhập lý do...")
-        if st.button("🚫 Đóng máy chủ", type="secondary"):
+        reason = st.text_input("Lý do đóng máy chủ", placeholder="Nhập lý do...", key="close_reason")
+        if st.button("🚫 Đóng máy chủ", type="secondary", key="close_server"):
             admin_config["server_closed"] = True
             admin_config["server_closed_reason"] = reason.strip() or "Không có lý do"
             save_json(f"{DATA_DIR}/admin_config.json", admin_config, "Đóng máy chủ")
