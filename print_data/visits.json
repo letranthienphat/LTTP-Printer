@@ -1,4 +1,9 @@
 {
-  "total_visits": 0,
-  "visits": []
+  "total_visits": 1,
+  "visits": [
+    {
+      "timestamp": "2026-10-28T10:55:07.332634",
+      "session_id": "2cebb5b2-5d1d-43a0-9a05-21645eb96cbb"
+    }
+  ]
 }
