@@ -1,20 +1,6 @@
 {
   "requests": [
     {
-      "id": "588bc8b8",
-      "user_name": "Phát",
-      "session_id": "99a414fd-56a4-489f-9a70-6d34fa824409",
-      "file_name": "1141478 - Lê Trần Thiên Phát.jpg",
-      "file_path": "print_data/files/588bc8b8.json",
-      "file_size": 232930,
-      "note": "",
-      "status": "pending",
-      "admin_reply": null,
-      "reply_read": false,
-      "created_at": "2026-10-28T11:28:53.232592",
-      "confirmed_at": null
-    },
-    {
       "id": "54041c62",
       "user_name": "Phát",
       "session_id": "9f88cdc6-c2e8-4f79-8620-edd39c217ec6",
